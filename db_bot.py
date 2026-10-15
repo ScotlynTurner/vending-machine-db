@@ -1,204 +1,156 @@
-import json
-from openai import OpenAI
+"""Ask questions about the vending machine database in plain English.
+
+Flow: question -> GPT (with schema) -> SQL -> SQLite -> GPT -> plain-English answer
+
+Usage:
+    python app.py                       # zero-shot (default)
+    python app.py --strategy few-shot   # include example question/SQL pairs
+"""
+import argparse
 import os
 import sqlite3
-from time import time
 
-print("Running db_bot.py!")
+from dotenv import load_dotenv
+from openai import OpenAI
 
-fdir = os.path.dirname(__file__)
-def getPath(fname):
-    return os.path.join(fdir, fname)
+load_dotenv()
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-# SQLITE
-sqliteDbPath = getPath("aidb.sqlite")
-setupSqlPath = getPath("setup.sql")
-setupSqlDataPath = getPath("setupData.sql")
+MODEL = "gpt-4o-mini"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "aidb.sqlite")
 
-# Erase previous db
-if os.path.exists(sqliteDbPath):
-    os.remove(sqliteDbPath)
+# Strategy 1 (zero-shot): the schema is all the model gets.
+# Foreign keys are in the schema text, and sample rows are added below.
+FEW_SHOT_EXAMPLES = """
+Q: How much money has each machine made?
+SQL:
+SELECT vm.id, vm.type, vm.address,
+       ROUND(COALESCE(SUM(s.price_charged), 0), 2) AS total_revenue_dollars
+FROM vending_machine AS vm
+LEFT JOIN sale AS s ON s.vend_id = vm.id
+GROUP BY vm.id, vm.type, vm.address;
 
-# create new db
-sqliteCon = sqlite3.connect(sqliteDbPath) 
-sqliteCursor = sqliteCon.cursor()
+Q: What is the profit on each product sold?
+SQL:
+SELECT mi.name,
+       ROUND(SUM(s.price_charged - mi.price), 2) AS estimated_profit_dollars
+FROM sale AS s
+JOIN market_item AS mi ON mi.id = s.item_id
+GROUP BY mi.id, mi.name;
+"""
 
-# read in setup files
-with (
-        open(setupSqlPath) as setupSqlFile,
-        open(setupSqlDataPath) as setupSqlDataFile
-    ):
+def get_schema_and_samples(conn):
+    """Schema text (with foreign keys) plus 3 sample rows per table."""
+    parts = []
+    tables = conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table'").fetchall()
+    for name, create_sql in tables:
+        parts.append(create_sql + ";")
+        rows = conn.execute(f"SELECT * FROM {name} LIMIT 3").fetchall()
+        parts.append(f"-- sample rows from {name}: {rows}")
+    return "\n".join(parts)
 
-    setupSqlScript = setupSqlFile.read()
-    setupSQlDataScript = setupSqlDataFile.read()
 
-# execute setup files
-sqliteCursor.executescript(setupSqlScript) # setup tables and keys
-sqliteCursor.executescript(setupSQlDataScript) # setup tables and keys
-
-def runSql(query):
-    result = sqliteCursor.execute(query).fetchall()
-    return result
-
-# OPENAI
-configPath = getPath("config.json")
-print(configPath)
-with open(configPath) as configFile:
-    config = json.load(configFile)
-
-openAiClient = OpenAI(api_key = config["openaiKey"])
-openAiClient.models.list() # check if the key is valid (update in config.json)
-chosen_model = "gpt-4o"
-
-def getChatGptResponse(content):
-    stream = openAiClient.chat.completions.create(
-        model=chosen_model,
-        messages=[{"role": "user", "content": content}],
-        stream=True,
+def ask_gpt(system, user):
+    resp = client.chat.completions.create(
+        model=MODEL,
+        temperature=0,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
     )
-
-    responseList = []
-    for chunk in stream:
-        if chunk.choices[0].delta.content is not None:
-            responseList.append(chunk.choices[0].delta.content)
-
-    result = "".join(responseList)
-    return result
+    return resp.choices[0].message.content.strip()
 
 
-# strategies
-commonSqlOnlyRequest = " Give me a sqlite select statement that answers the question. Only respond with sqlite syntax. If there is an error do not explain it!"
-strategies = {
-    "zero_shot": (
-        setupSqlScript + commonSqlOnlyRequest
-    ),
-
-    "single_domain_double_shot": (
-        setupSqlScript
-        + """
-            Example question: Which vending machines have products with fewer than 5 items?
-            Example SQL:
-            SELECT DISTINCT machine_id
-            FROM inventory
-            WHERE quantity < 5;
-        """
-            + commonSqlOnlyRequest
-        ),
-
-        "cross_domain_double_shot": (
-            """
-                Example database schema:
-                CREATE TABLE library_branch (
-                    branch_id INTEGER PRIMARY KEY
-                );
-                CREATE TABLE book_stock (
-                    branch_id INTEGER,
-                    copies INTEGER,
-                    FOREIGN KEY (branch_id) REFERENCES library_branch(branch_id)
-                );
-
-                Example question: Which library branches have no copies in stock?
-                Example SQL:
-                SELECT b.branch_id
-                FROM library_branch AS b
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM book_stock AS s
-                    WHERE s.branch_id = b.branch_id
-                    AND s.copies > 0
-                );
-            """
-        + setupSqlScript
-        + commonSqlOnlyRequest
+def question_to_sql(question, schema, strategy):
+    system = (
+        "You write SQLite queries. Given the database schema, reply with ONE SQL "
+        "SELECT query and nothing else (no markdown, no explanation). "
+        "Prices are stored in cents."
     )
-}
-
-questions = [
-    "Which vending machines are out of stock?",
-    "Which products are out of stock in any machine?",
-    "Which products have fewer than 5 items left?",
-    "What products are in vending machine 1?",
-    "Which vending machines carry pepsi?",
-    "Which vending machine has the most items in stock?",
-    "How many of each product are in stock across all machines?",
-    "Which vending machine has the greatest variety of products?"
-]
+    user = f"Schema:\n{schema}\n"
+    if strategy == "few-shot":
+        user += f"\nExamples:\n{FEW_SHOT_EXAMPLES}\n"
+    user += f"\nQ: {question}\nSQL:"
+    sql = ask_gpt(system, user)
+    return sql.replace("```sql", "").replace("```", "").strip()
 
 
-# use the markdown for the sql syntax to find the SQL query
-def sanitizeForJustSql(value):
-    gptStartSqlMarker = "```"
-    gptEndSqlMarker = "```"
-    if gptStartSqlMarker in value:
-        # Split at the first ``` and take everything after it
-        value = value.split(gptStartSqlMarker, 1)[1]
-        # Find the newline after the language identifier (sql, sqlite, etc.)
-        newline_index = value.find("\n")
-        if newline_index != -1:
-            value = value[newline_index + 1:]
-    if gptEndSqlMarker in value:
-        # Split at the closing ``` and take everything before it
-        value = value.split(gptEndSqlMarker, 1)[0]
+def run_sql(conn, sql):
+    # Only allow reads
+    if not sql.lstrip().lower().startswith("select"):
+        raise ValueError("Refusing to run non-SELECT query")
+    cur = conn.execute(sql)
+    cols = [c[0] for c in cur.description]
+    return cols, cur.fetchall()
 
-    return value.strip()
 
-for strategy in strategies:
-    responses = {"strategy": strategy, "prompt_prefix": strategies[strategy]}
-    questionResults = []
-    print("########################################################################")
-    print(f"Running strategy: {strategy}")
-    for question in questions:
+def answer_in_english(question, sql, cols, rows):
+    system = "You answer questions about a vending machine business in friendly plain English. Prices in the data are in cents; show dollars."
+    user = f"Question: {question}\nSQL used: {sql}\nColumns: {cols}\nRows: {rows}\n\nAnswer the question."
+    return ask_gpt(system, user)
 
-        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-        print("Question:")
-        print(question)
-        sqlSyntaxResponse = ""
-        queryRawResponse = ""
-        friendlyResponse = ""
-        error = "None"
+def create_database():
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("PRAGMA foreign_keys = ON")
+
+    setup_path = os.path.join(BASE_DIR, "setup.sql")
+    data_path = os.path.join(BASE_DIR, "setupData.sql")
+
+    print("Creating tables from setup.sql...")
+    with open(setup_path, encoding="utf-8") as file:
+        conn.executescript(file.read())
+
+    print("Tables created. Loading setupData.sql...")
+    with open(data_path, encoding="utf-8") as file:
+        data_sql = file.read()
+
+    for number, statement in enumerate(data_sql.split(";"), start=1):
+        if not statement.strip():
+            continue
+
         try:
-            getSqlFromQuestionEngineeredPrompt = strategies[strategy] + " " + question
-            sqlSyntaxResponse = getChatGptResponse(getSqlFromQuestionEngineeredPrompt)
-            sqlSyntaxResponse = sanitizeForJustSql(sqlSyntaxResponse)
-            print("SQL Syntax Response:")
-            print(sqlSyntaxResponse)
-            queryRawResponse = str(runSql(sqlSyntaxResponse))
-            print("Query Raw Response:")
-            print(queryRawResponse)
+            conn.execute(statement)
+        except sqlite3.IntegrityError:
+            print(f"Foreign-key error in data statement {number}:")
+            print(statement)
+            print("Machine rows:", conn.execute(
+                "SELECT * FROM vending_machine"
+            ).fetchall())
+            print("Lane rows:", conn.execute(
+                "SELECT * FROM lane"
+            ).fetchall())
+            raise
 
-            friendlyResultsPrompt = f"""
-            Answer the user's question using only the database results below.
-            The results are in JSON format, with column names included.
-            If the results are empty, say that no matching records were found.
-            Do not guess or add information that is not in the results.
-            Keep the answer concise and friendly.
-
-            User's question: {question}
-            SQL query: {sqlSyntaxResponse}
-            Database results: {json.dumps(queryRawResponse)}
-            """
-
-            friendlyResponse = getChatGptResponse(friendlyResultsPrompt)
-            print("Friendly Response:")
-            print(friendlyResponse)
-        except Exception as err:
-            error = str(err)
-            print(err)
-
-        questionResults.append({
-            "question": question,
-            "sql": sqlSyntaxResponse,
-            "queryRawResponse": queryRawResponse,
-            "friendlyResponse": friendlyResponse,
-            "error": error
-        })
-
-    responses["questionResults"] = questionResults
-
-    with open(getPath(f"response_{strategy}_{time()}.json"), "w") as outFile:
-        json.dump(responses, outFile, indent = 2)
+    conn.commit()
+    conn.execute("PRAGMA query_only = ON")
+    return conn
 
 
-sqliteCursor.close()
-sqliteCon.close()
-print("Done!")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--strategy", choices=["zero-shot", "few-shot"], default="zero-shot")
+    args = parser.parse_args()
+
+    conn = create_database()
+    schema = get_schema_and_samples(conn)
+    print(f"Vending machine assistant ({args.strategy}). Type 'quit' to exit.")
+
+    while True:
+        question = input("\nAsk a question: ").strip()
+        if question.lower() in ("quit", "exit", ""):
+            break
+        sql = question_to_sql(question, schema, args.strategy)
+        print(f"\nSQL: {sql}")
+        try:
+            cols, rows = run_sql(conn, sql)
+        except Exception as e:
+            print(f"SQL failed: {e}")
+            continue
+        print(f"Rows: {rows}")
+        print(f"\nAnswer: {answer_in_english(question, sql, cols, rows)}")
+
+
+if __name__ == "__main__":
+    main()
